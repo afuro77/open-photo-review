@@ -1,0 +1,6 @@
+Pillow>=10
+pillow-heif
+numpy
+rawpy
+Send2Trash>=2.1
+pywin32
