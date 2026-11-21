@@ -8,6 +8,7 @@ import tkinter as tk
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -32,6 +33,7 @@ DATA_HOME = Path(os.environ.get("OPEN_PHOTO_REVIEW_DATA", Path(os.environ["LOCAL
 DATA = DATA_HOME / ROOT_ID
 STATE = DATA / "reviews.json"
 SETTINGS = STATE.with_name("settings.json")
+HISTORY = STATE.with_name("history.log")
 RAW = {".orf", ".raw", ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".rw2"}
 
 
@@ -190,7 +192,7 @@ class ReviewApp:
             raise ValueError("完全一致・類似の候補は見つかりませんでした。")
         self.keys = list(self.groups)
         self.state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
-        self.settings = {"confirm_group": True, "confirm_bulk": True, "priority": "size"}
+        self.settings = {"confirm_group": True, "confirm_bulk": True, "priority": "size", "advance": True}
         if SETTINGS.is_file():
             try:
                 self.settings.update(json.loads(SETTINGS.read_text(encoding="utf-8")))
@@ -205,6 +207,9 @@ class ReviewApp:
         self.busy = False
 
         window.title("重複写真の整理")
+        icon = Path(__file__).resolve().with_name("photo-review.ico")
+        if icon.is_file():
+            window.iconbitmap(default=str(icon))
         window.geometry("1200x790")
         window.minsize(870, 640)
         window.configure(bg="#eef2f5")
@@ -219,6 +224,7 @@ class ReviewApp:
         modes = ttk.Frame(shell)
         modes.pack(fill="x", pady=(8, 12))
         ttk.Button(modes, text="設定", command=self.open_settings).pack(side="right")
+        ttk.Button(modes, text="作業ログ", command=self.open_history).pack(side="right", padx=6)
         for mode in (self.EXACT, self.SIMILAR):
             ttk.Radiobutton(modes, text=mode, value=mode, variable=self.mode,
                             command=self.switch_mode).pack(side="left", padx=(0, 18))
@@ -233,16 +239,25 @@ class ReviewApp:
         self.jump.bind("<Return>", lambda _: self.go())
         ttk.Button(nav, text="番号へ移動", command=self.go).pack(side="left", padx=6)
         ttk.Button(nav, text="次の未確認へ", command=self.next_pending).pack(side="left", padx=6)
+        ttk.Button(nav, text="一覧を再読み込み", command=self.reload_list).pack(side="left", padx=6)
         self.summary = ttk.Label(nav)
         self.summary.pack(side="right")
+        slider_row = ttk.Frame(shell)
+        slider_row.pack(fill="x", pady=(5, 0))
+        ttk.Label(slider_row, text="グループ移動").pack(side="left", padx=(0, 8))
+        self.slider_label = ttk.Label(slider_row, width=20, anchor="e")
+        self.slider_label.pack(side="right", padx=(8, 0))
+        self.slider = ttk.Scale(slider_row, orient="horizontal", from_=1, to=max(2, len(self.keys)),
+                                command=self.preview_slider)
+        self.slider.pack(side="left", fill="x", expand=True)
+        self.slider.bind("<ButtonRelease-1>", self.commit_slider)
+        self.slider.bind("<KeyRelease>", self.commit_slider)
         comparison = ttk.Frame(shell)
         comparison.pack(fill="x", pady=(5, 0))
         self.size_comparison = ttk.Label(comparison, padding=(8, 3))
         self.size_comparison.pack(side="left", padx=(0, 6))
         self.name_comparison = ttk.Label(comparison, padding=(8, 3))
         self.name_comparison.pack(side="left")
-        if DRIVE_FOLDER:
-            ttk.Label(comparison, text="ごみ箱への移動は Google Drive にも反映されます", foreground="#814000").pack(side="right")
         self.cards = ttk.Frame(shell)
         self.footer = ttk.Frame(shell)
         self.footer.pack(fill="x")
@@ -254,8 +269,10 @@ class ReviewApp:
         self.bulk_button = ttk.Button(actions, text="完全一致の重複をまとめてごみ箱へ",
                                        command=self.confirm_bulk)
         self.bulk_button.pack(side="left", padx=8)
-        ttk.Button(self.footer, text="‹ 前の写真", command=lambda: self.change_page(-1)).pack(side="left")
-        ttk.Button(self.footer, text="次の写真 ›", command=lambda: self.change_page(1)).pack(side="left", padx=6)
+        self.prev_photo_button = ttk.Button(self.footer, text="‹ 前の写真", command=lambda: self.change_page(-1))
+        self.prev_photo_button.pack(side="left")
+        self.next_photo_button = ttk.Button(self.footer, text="次の写真 ›", command=lambda: self.change_page(1))
+        self.next_photo_button.pack(side="left", padx=6)
         self.page_label = ttk.Label(self.footer)
         self.page_label.pack(side="left", padx=6)
         self.delete_button = ttk.Button(actions, command=self.confirm_recycle)
@@ -267,7 +284,85 @@ class ReviewApp:
         self.cards.bind("<Configure>", self.schedule_resize)
         window.update_idletasks()
         window.update_idletasks()
+        self.reload_list(quiet=True)
+
+    def reload_list(self, quiet=False):
+        if self.busy:
+            return
+        filename = "photo-similar.csv" if self.mode.get() == self.SIMILAR else "photo-duplicates.csv"
+        try:
+            groups = read_groups(filename)
+            if not groups:
+                raise ValueError("候補が見つかりませんでした。")
+            current = self.key()
+            restored = []
+            for digest, entries in self.state.items():
+                for relative, status in entries.items():
+                    if status == "trashed":
+                        photo = Photo(relative, digest, False)
+                        try:
+                            if photo.path().is_file():
+                                restored.append(photo)
+                        except (OSError, ValueError):
+                            continue
+            for photo in restored:
+                self.state[photo.digest][photo.relative] = "pending"
+            if restored:
+                try:
+                    self.save()
+                except OSError:
+                    for photo in restored:
+                        self.state[photo.digest][photo.relative] = "trashed"
+                    raise
+        except (OSError, ValueError) as error:
+            self.render()
+            self.result.configure(text=f"一覧を再読み込みできませんでした。 {error}")
+            return
+        self.groups, self.keys = groups, list(groups)
+        self.index = self.keys.index(current) if current in groups else 0
+        self.page = min(self.page, (len(self.photos()) - 1) // self.PAGE_SIZE)
         self.render()
+        if restored:
+            self.record_history("復元を確認", (p.relative for p in restored))
+            self.result.configure(text=f"元の場所に戻った {len(restored):,} 枚を、一覧で「保留」に戻しました。")
+        elif not quiet:
+            self.result.configure(text="一覧を再読み込みしました。")
+
+    def record_history(self, action, paths, note=""):
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        items = [str(path) for path in paths]
+        try:
+            HISTORY.parent.mkdir(parents=True, exist_ok=True)
+            with HISTORY.open("a", encoding="utf-8") as stream:
+                stream.write(f"{timestamp}  {action}  {len(items):,} 枚\n")
+                for item in items:
+                    stream.write(f"  {item}\n")
+                if note:
+                    stream.write(f"  {note}\n")
+                stream.write("\n")
+        except OSError as error:
+            messagebox.showerror("作業ログを保存できませんでした", str(error), parent=self.window)
+
+    def open_history(self):
+        try:
+            text = HISTORY.read_text(encoding="utf-8") if HISTORY.is_file() else ""
+        except OSError as error:
+            messagebox.showerror("作業ログを開けませんでした", str(error), parent=self.window)
+            return
+        dialog = tk.Toplevel(self.window)
+        dialog.title("作業ログ")
+        dialog.geometry("740x420")
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill="both", expand=True)
+        scroll = ttk.Scrollbar(container)
+        scroll.pack(side="right", fill="y")
+        box = tk.Text(container, wrap="char", yscrollcommand=scroll.set)
+        box.pack(side="left", fill="both", expand=True)
+        scroll.configure(command=box.yview)
+        box.insert("1.0", text or "作業ログはまだありません。")
+        box.configure(state="disabled")
+        box.see("end")
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
 
     def open_settings(self):
         if self.busy:
@@ -285,6 +380,7 @@ class ReviewApp:
         confirm_group = tk.BooleanVar(dialog, self.settings["confirm_group"])
         confirm_bulk = tk.BooleanVar(dialog, self.settings["confirm_bulk"])
         priority = tk.StringVar(dialog, self.settings["priority"])
+        advance = tk.BooleanVar(dialog, self.settings["advance"])
         ttk.Label(body, text="ごみ箱へ移す前の確認", style="Card.TLabel").pack(anchor="w")
         ttk.Checkbutton(body, text="このグループを整理するとき", variable=confirm_group).pack(anchor="w")
         ttk.Checkbutton(body, text="完全一致を一括で整理するとき", variable=confirm_bulk).pack(anchor="w")
@@ -294,9 +390,12 @@ class ReviewApp:
         ttk.Radiobutton(body, text="ファイル名 → ファイルサイズ", value="name",
                         variable=priority).pack(anchor="w")
 
+        ttk.Checkbutton(body, text="おすすめで整理したあと、次の未確認へ進む",
+                        variable=advance).pack(anchor="w", pady=(12, 0))
+
         def apply():
             settings = {"confirm_group": confirm_group.get(), "confirm_bulk": confirm_bulk.get(),
-                        "priority": priority.get()}
+                        "priority": priority.get(), "advance": advance.get()}
             try:
                 SETTINGS.parent.mkdir(parents=True, exist_ok=True)
                 temporary = SETTINGS.with_suffix(".tmp")
@@ -395,16 +494,39 @@ class ReviewApp:
         self.page = 0
         self.render()
 
-    def next_pending(self):
+    def next_pending(self, quiet=False):
         if self.busy:
-            return
-        for offset in range(1, len(self.keys) + 1):
+            return False
+        for offset in range(1, len(self.keys)):
             index = (self.index + offset) % len(self.keys)
-            if any(self.status(p) == "pending" for p in self.groups[self.keys[index]]):
+            group = self.groups[self.keys[index]]
+            if not any(self.status(p) == "pending" for p in group):
+                continue
+            available = self.available_photos(group)
+            if len(available) >= 2 and any(self.status(p) == "pending" for p in available):
                 self.index, self.page = index, 0
+                self.result.configure(text="")
                 self.render()
-                return
-        messagebox.showinfo("確認完了", "保留の写真はありません。")
+                return True
+        if not quiet:
+            self.result.configure(text="ほかに確認待ちのグループはありません。")
+        return False
+
+    def slider_index(self, value):
+        return max(0, min(len(self.keys) - 1, round(float(value)) - 1))
+
+    def preview_slider(self, value):
+        target = self.slider_index(value)
+        self.slider_label.configure(text=f"{self.keys[target]} / {len(self.keys):,}")
+
+    def commit_slider(self, _event=None):
+        if self.busy:
+            self.slider.set(self.index + 1)
+            return
+        target = self.slider_index(self.slider.get())
+        if target != self.index:
+            self.index, self.page = target, 0
+            self.render()
 
     def change_page(self, delta):
         if not self.busy:
@@ -412,8 +534,9 @@ class ReviewApp:
             self.page = max(0, min(last, self.page + delta))
             self.render()
 
-    def available_photos(self):
-        return [p for p in self.photos() if self.status(p) != "trashed" and p.path().is_file()]
+    def available_photos(self, group=None):
+        photos = self.photos() if group is None else group
+        return [p for p in photos if self.status(p) != "trashed" and p.path().is_file()]
 
     def recommendation(self, available=None, group=None):
         photos = self.available_photos() if available is None else available
@@ -475,6 +598,8 @@ class ReviewApp:
             return
         try:
             completed, skipped, error = future.result()
+            self.record_history("完全一致を一括でごみ箱へ", (p.relative for p in completed),
+                                f"移動できなかった枚数 {skipped:,}。 {error or ''}" if skipped else "")
             for photo in completed:
                 self.state.setdefault(photo.digest, {})[photo.relative] = "trashed"
             if completed:
@@ -494,8 +619,15 @@ class ReviewApp:
             messagebox.showinfo("移動できなかった写真があります", f"{result}\n\n最初の理由  {error}")
 
     def refresh_footer(self):
+        self.prev_photo_button.configure(state="normal" if self.page > 0 and not self.busy else "disabled")
+        has_next_page = (self.page + 1) * self.PAGE_SIZE < len(self.photos())
+        self.next_photo_button.configure(state="normal" if has_next_page and not self.busy else "disabled")
         self.bulk_button.configure(state="normal" if self.active_mode == self.EXACT and not self.busy else "disabled")
-        self.quick_button.configure(state="disabled" if self.busy or len(self.available_photos()) < 2 else "normal")
+        quick_label = "おすすめを残し、ほかをごみ箱へ"
+        if self.settings["advance"]:
+            quick_label += " → 次へ"
+        self.quick_button.configure(text=quick_label,
+                                    state="disabled" if self.busy or len(self.available_photos()) < 2 else "normal")
         count = sum(self.status(p) == "delete" for p in self.photos())
         self.delete_button.configure(text=f"このグループの削除候補 {count} 枚をごみ箱へ",
                                      state="normal" if count and not self.busy else "disabled")
@@ -530,6 +662,9 @@ class ReviewApp:
                             foreground="#165634" if same else "#814000")
         first = self.page * self.PAGE_SIZE
         visible = photos[first:first + self.PAGE_SIZE]
+        self.slider.configure(to=max(2, len(self.keys)), state="normal" if len(self.keys) > 1 else "disabled")
+        self.slider.set(self.index + 1)
+        self.preview_slider(self.index + 1)
         self.jump.delete(0, "end")
         self.jump.insert(0, self.key())
         self.summary.configure(text=f"グループ {self.key()} / {len(self.keys):,}　·　{len(photos)}枚")
@@ -637,6 +772,7 @@ class ReviewApp:
             completed, error = future.result()
         except Exception as failure:
             completed, error = [], str(failure)
+        self.record_history("グループからごみ箱へ", completed, error or "")
         digests = {photo.relative: photo.digest for photo in photos}
         for relative in completed:
             self.state.setdefault(digests[relative], {})[relative] = "trashed"
@@ -648,11 +784,17 @@ class ReviewApp:
             except OSError as failure:
                 error = str(failure)
         self.busy = False
-        self.render()
+        auto_advance = completed and not error and recommended and self.settings["advance"]
+        advanced = self.next_pending(quiet=True) if auto_advance else False
+        if not advanced:
+            self.render()
         if error:
             messagebox.showerror("処理を中断しました", f"{len(completed)} 枚をごみ箱へ移動しました。\n\n{error}")
         else:
-            self.result.configure(text=f"{len(completed)} 枚をごみ箱へ移動しました。")
+            result = f"{len(completed)} 枚をごみ箱へ移動しました。"
+            if auto_advance and not advanced:
+                result += " ほかに確認待ちのグループはありません。"
+            self.result.configure(text=result)
 
 
 def main():
