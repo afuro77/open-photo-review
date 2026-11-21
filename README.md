@@ -15,6 +15,10 @@ python -m venv .venv
 
 Google Driveの同期フォルダを開くときは、最後のコマンドに `--google-drive` を追加すると、ごみ箱へ移す前の確認画面に、ごみ箱へ移す前の確認画面に、クラウド側にも移動が反映される旨を表示します。
 
+## 表示言語
+
+右上の「設定」で日本語と英語を切り替えられます。保存すると同じグループを選んだ状態で画面が開き直ります。
+
 ## 比較と整理
 
 - **完全に同じ写真**は、ファイルサイズで候補を絞り、SHA-256で照合します。
@@ -36,3 +40,7 @@ Google Driveの同期フォルダを開くときは、最後のコマンドに `
 ## ライセンス
 
 このプロジェクトのソースは [MIT License](LICENSE) で提供します。依存ライブラリにはそれぞれのライセンスが適用されます。
+
+## English quick start
+
+Open Photo Review compares exact duplicates and visually similar photos locally on Windows. Install the Python dependencies, run `python scan.py PHOTO_FOLDER`, then run `python photo_review.py PHOTO_FOLDER`. Open **Settings**, choose **English**, and save. Review choices, preferences, and activity logs are stored locally. Check your candidates before moving them to the Recycle Bin, especially in **Visually similar** mode.
