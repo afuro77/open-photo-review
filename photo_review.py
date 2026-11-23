@@ -509,12 +509,20 @@ class ReviewApp:
         temp.replace(STATE)
 
     def update_status(self, photo, status):
-        self.state.setdefault(photo.digest, {})[photo.relative] = status
+        choices = self.state.setdefault(photo.digest, {})
+        previous = choices.get(photo.relative)
+        choices[photo.relative] = status
         try:
             self.save()
         except OSError as error:
+            if previous is None:
+                choices.pop(photo.relative)
+            else:
+                choices[photo.relative] = previous
             messagebox.showerror(tr('振り分けの保存に失敗しました'), str(error))
+            return False
         self.refresh_footer()
+        return True
 
     def close(self):
         if self.busy:
@@ -779,24 +787,29 @@ class ReviewApp:
                         lambda _, p=photo, c=choice: self.choose(p, c))
             choice.pack(anchor="w", pady=(8, 3))
             if photo == recommended:
-                ttk.Button(card, text=tr('おすすめを残す'),
-                           command=lambda p=photo, c=choice: self.accept_recommendation(p, c)).pack(anchor="w", pady=(0, 3))
+                saved = status == "keep"
+                ttk.Button(card, text=tr('残す指定済み') if saved else tr('この写真を残す'),
+                           state="disabled" if saved else "normal",
+                           command=lambda p=photo: self.accept_recommendation(p)).pack(anchor="w", pady=(0, 3))
             ttk.Button(card, text=tr('元の写真を開く'), command=lambda p=photo: self.open_photo(p)).pack(anchor="w")
             label.pack(side="bottom", fill="both", expand=True, pady=8)
             future = self.pool.submit(preview, photo, (width, height))
             self.show_preview(label, future, self.generation)
         self.refresh_footer()
 
-    def accept_recommendation(self, photo, choice):
-        if not self.busy:
-            choice.set(tr('残す'))
-            self.update_status(photo, "keep")
+    def accept_recommendation(self, photo):
+        if not self.busy and self.update_status(photo, "keep"):
+            self.render()
+            self.result.configure(text=tr('残す指定を保存しました。'))
 
     def choose(self, photo, choice):
         if self.busy:
             choice.set(self.labels[self.status(photo)])
             return
-        self.update_status(photo, self.options[choice.get()])
+        if self.update_status(photo, self.options[choice.get()]):
+            self.render()
+        else:
+            choice.set(self.labels[self.status(photo)])
 
     def open_photo(self, photo):
         try:
